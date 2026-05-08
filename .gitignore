@@ -1,6 +1,9 @@
 # Patient data and generated outputs — never commit these
-input/
-output/
+input/*
+!input/.gitkeep
+!input/README.txt
+output/*
+!output/.gitkeep
 
 # Python
 __pycache__/
