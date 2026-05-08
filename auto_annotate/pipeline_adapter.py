@@ -74,8 +74,15 @@ def extract_annotations(input_folder: str) -> dict[str, Any]:
     if subject.boxes:
         subject = _fill_subject_track_gaps(subject)
 
+    # Extract pose signal once; shared by phase detection and foot detection below
+    pose_signal = None
+    if video_path and video_path.exists() and video_path.stat().st_size > 0:
+        from .pose_estimator import extract_pose_signal, pose_available
+        if pose_available():
+            pose_signal = extract_pose_signal(video_path, warnings)
+
     if _is_crt_folder(folder):
-        return _extract_crt_annotations(folder, video_path, metadata, subject, warnings)
+        return _extract_crt_annotations(folder, video_path, metadata, subject, pose_signal, warnings)
 
     precomputed = _extract_from_precomputed_outputs(folder, metadata, warnings)
     if precomputed:
@@ -88,11 +95,18 @@ def extract_annotations(input_folder: str) -> dict[str, Any]:
         metadata=metadata,
         subject=subject,
         face_path=face_path,
+        pose_signal=pose_signal,
         warnings=warnings,
     )
     test = test_interval_from_phases(phases)
     walks = walking_intervals(phases)
-    left_foot, right_foot = fallback_foot_intervals(walks) if walks else ([], [])
+
+    left_foot, right_foot = [], []
+    if pose_signal and walks:
+        from .pose_estimator import foot_intervals_from_pose_signal
+        left_foot, right_foot = foot_intervals_from_pose_signal(pose_signal, metadata, walks, warnings)
+    if not left_foot and not right_foot:
+        left_foot, right_foot = fallback_foot_intervals(walks) if walks else ([], [])
 
     return {
         "video_path": str(video_path) if video_path else None,
@@ -116,11 +130,12 @@ def _extract_crt_annotations(
     video_path: "Path | None",
     metadata: "VideoMetadata",
     subject: "SubjectTrack",
+    pose_signal: "dict | None",
     warnings: list[str],
 ) -> "dict[str, Any]":
     phases = _extract_from_crt_precomputed(folder, metadata, warnings)
     if not phases:
-        phases = _crt_phase_from_bundle_fallback(metadata, subject, warnings)
+        phases = _crt_phase_from_bundle_fallback(metadata, subject, pose_signal, warnings)
 
     test = test_interval_from_phases(phases)
     return {
@@ -178,8 +193,16 @@ def _find_sppb_results(folder: Path) -> "Path | None":
 def _crt_phase_from_bundle_fallback(
     metadata: "VideoMetadata",
     subject: "SubjectTrack",
+    pose_signal: "dict | None",
     warnings: list[str],
 ) -> "list[Interval]":
+    if pose_signal is not None:
+        from .pose_estimator import crt_phases_from_pose_signal
+        pose_phases = crt_phases_from_pose_signal(pose_signal, metadata, warnings)
+        if pose_phases:
+            warnings.append("CRT phases detected using MediaPipe pose estimation")
+            return pose_phases
+
     if not subject.boxes:
         if metadata.duration_ms > 0:
             warnings.append("no person bounding boxes found for CRT; writing unknown phase")
@@ -251,12 +274,20 @@ def _phase_from_bundle_fallback(
     metadata: VideoMetadata,
     subject: SubjectTrack,
     face_path: Path | None,
+    pose_signal: "dict | None",
     warnings: list[str],
 ) -> list[Interval]:
     if subject.boxes and face_path:
         core_phases = _try_core_bbox_phase_segmentation(metadata, subject.boxes, face_path, warnings)
         if core_phases:
             return core_phases
+
+    if pose_signal is not None:
+        from .pose_estimator import tug_phases_from_pose_signal
+        pose_phases = tug_phases_from_pose_signal(pose_signal, metadata, warnings)
+        if pose_phases:
+            warnings.append("TUG phases detected using MediaPipe pose estimation")
+            return pose_phases
 
     if subject.boxes:
         motion_phases = _phase_from_body_motion(metadata, subject.boxes)

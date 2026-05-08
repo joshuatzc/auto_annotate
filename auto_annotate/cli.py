@@ -395,6 +395,8 @@ def _source_label(source: str | None) -> str:
         return "unknown"
     if any(k in source for k in ("core_tug", "crt_events", "core_gait", "precomputed")):
         return "precomputed pipeline"
+    if "pose_estimation" in source or "pose_gait" in source:
+        return "pose estimation"
     if "core_bbox" in source or ("bbox" in source and "fallback" not in source and "motion" not in source):
         return "bbox+face detection"
     if "motion_fallback" in source or "bbox_motion" in source:
