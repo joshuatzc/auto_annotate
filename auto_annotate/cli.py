@@ -1,17 +1,21 @@
-"""CLI for the TUG ELAN auto-annotation pre-labeller."""
+"""CLI for the FrailScreen ELAN auto-annotation pre-labeller."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import config as config_values
 from .config import FALLBACK_PHASE_RATIOS, FALLBACK_STANCE_RATIO, FALLBACK_STRIDE_MS, TUG_PHASE_SEQUENCE
-from .elan_export import write_eaf
+from .elan_export import validate_eaf, write_eaf
 from .pipeline_adapter import extract_annotations
 
 DEFAULT_BATCH_OUTPUT_FOLDER = "batch_annotations"
@@ -22,20 +26,20 @@ REVIEW_STATE_FILE = ".review_state.json"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create one TUG auto-annotation .eaf file.",
+        description="Create one FrailScreen test auto-annotation .eaf file.",
         epilog=(
             "Batch mode: python -m auto_annotate.cli batch "
             "INPUT_ROOT [OUTPUT_FOLDER]"
         ),
     )
-    parser.add_argument("input_folder", nargs="?", help="Folder containing the TUG input bundle.")
+    parser.add_argument("input_folder", nargs="?", help="Folder containing the input bundle.")
     parser.add_argument("output_eaf", nargs="?", help="Output .eaf path.")
     parser.add_argument(
         "-i",
         "--input-folder",
         "--input_folder",
         dest="input_folder_option",
-        help="Folder containing the TUG input bundle.",
+        help="Folder containing the input bundle.",
     )
     parser.add_argument(
         "-o",
@@ -44,15 +48,40 @@ def build_parser() -> argparse.ArgumentParser:
         dest="output_eaf_option",
         help="Output .eaf path.",
     )
+    parser.add_argument(
+        "--video",
+        help="Original RGB video file for TUG-only VisFrailTy output annotation mode.",
+    )
+    parser.add_argument(
+        "--pipeline-out",
+        "--pipeline_out",
+        dest="pipeline_out",
+        help="Folder containing VisFrailTy/3DGait-derived outputs for the video.",
+    )
+    parser.add_argument(
+        "--out",
+        dest="out_dir",
+        help="Output directory for TUG-only VisFrailTy output annotation mode.",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        help="YAML config override file for TUG-only VisFrailTy output annotation mode.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write [VideoID]_debug.json in TUG-only VisFrailTy output annotation mode.",
+    )
     return parser
 
 
 def build_batch_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auto_annotate.cli batch",
-        description="Create TUG auto-annotation .eaf files for every TUG folder under an input root.",
+        description="Create auto-annotation .eaf files for every FrailScreen test folder under an input root.",
     )
-    parser.add_argument("input_root", nargs="?", help="Folder to scan recursively for TUG folders.")
+    parser.add_argument("input_root", nargs="?", help="Folder to scan recursively for test folders.")
     parser.add_argument(
         "output_folder",
         nargs="?",
@@ -64,7 +93,7 @@ def build_batch_parser() -> argparse.ArgumentParser:
         "--input-folder",
         "--input_folder",
         dest="input_root_option",
-        help="Folder to scan recursively for TUG folders.",
+        help="Folder to scan recursively for test folders.",
     )
     parser.add_argument(
         "-o",
@@ -144,6 +173,89 @@ def build_review_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_evaluate_ground_truth_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="auto_annotate.cli evaluate-ground-truth",
+        description="Compare current auto annotations against ground_truth/*.eaf files.",
+    )
+    parser.add_argument(
+        "ground_truth_folder",
+        nargs="?",
+        default="ground_truth",
+        help="Folder containing *_ground_truth.eaf files. Defaults to ./ground_truth.",
+    )
+    parser.add_argument(
+        "-i",
+        "--input-folder",
+        "--input_folder",
+        dest="input_folder",
+        default=DEFAULT_INPUT_FOLDER,
+        help=f"Input folder root. Defaults to ./{DEFAULT_INPUT_FOLDER}.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full machine-readable report as JSON.",
+    )
+    parser.add_argument(
+        "--track-occlusion-score",
+        "--track-score",
+        action="store_true",
+        help="Append the current occlusion overlap score to a JSONL history file.",
+    )
+    parser.add_argument(
+        "--score-history",
+        help="Path for occlusion score history. Defaults to ground_truth/occlusion_score_history.jsonl.",
+    )
+    return parser
+
+
+def build_workbook_parser(prog: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"auto_annotate.cli {prog}",
+        description="Manage the Excel FrailScreen flywheel tracker.",
+    )
+    parser.add_argument(
+        "--excel",
+        required=True,
+        help="Path to visfrailty_screening_v7.xlsx or a generic FrailScreen flywheel workbook.",
+    )
+    if prog == "workbook-scan":
+        parser.add_argument(
+            "--input",
+            dest="input_root",
+            default=DEFAULT_INPUT_FOLDER,
+            help=f"Input folder root. Defaults to ./{DEFAULT_INPUT_FOLDER}.",
+        )
+        parser.add_argument(
+            "--output",
+            dest="output_root",
+            default=DEFAULT_OUTPUT_FOLDER,
+            help=f"Reviewed/output folder. Defaults to ./{DEFAULT_OUTPUT_FOLDER}.",
+        )
+        parser.add_argument(
+            "--batch-output",
+            dest="batch_output_root",
+            default=DEFAULT_BATCH_OUTPUT_FOLDER,
+            help=f"Batch output folder. Defaults to ./{DEFAULT_BATCH_OUTPUT_FOLDER}.",
+        )
+        parser.add_argument(
+            "--ground-truth",
+            dest="ground_truth_root",
+            default="ground_truth",
+            help="Ground truth folder. Defaults to ./ground_truth.",
+        )
+    if prog == "workbook-status":
+        parser.add_argument("--json", action="store_true", help="Print status as JSON.")
+    if prog in {"check-visfrailty", "check-3dgait"}:
+        parser.add_argument(
+            "--visfrailty-root",
+            dest="visfrailty_root",
+            help="Optional visfrailty_screening_v7 or visfrailty_outputs root to search for pipeline artifacts.",
+        )
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] == "batch":
@@ -152,6 +264,18 @@ def main(argv: list[str] | None = None) -> int:
         return _run_review(argv[1:])
     if argv and argv[0] == "calibrate":
         return _run_calibrate(argv[1:])
+    if argv and argv[0] in {"evaluate-ground-truth", "eval-ground-truth", "evaluate"}:
+        return _run_evaluate_ground_truth(argv[1:])
+    if argv and argv[0] == "workbook-init":
+        return _run_workbook_init(argv[1:])
+    if argv and argv[0] == "workbook-scan":
+        return _run_workbook_scan(argv[1:])
+    if argv and argv[0] == "check-visfrailty":
+        return _run_check_visfrailty(argv[1:])
+    if argv and argv[0] == "check-3dgait":
+        return _run_check_visfrailty(argv[1:], alias="check-3dgait")
+    if argv and argv[0] == "workbook-status":
+        return _run_workbook_status(argv[1:])
     if not argv:
         return _run_default_batch()
     return _run_single(argv)
@@ -162,7 +286,7 @@ def _run_default_batch() -> int:
     output_root = Path(DEFAULT_OUTPUT_FOLDER)
     if not input_root.exists() or not input_root.is_dir():
         print(f"No arguments given and no '{DEFAULT_INPUT_FOLDER}/' folder found.")
-        print(f"  Drop TUG/CRT bundles into a folder named '{DEFAULT_INPUT_FOLDER}/' next to this script,")
+        print(f"  Drop FrailScreen test bundles into a folder named '{DEFAULT_INPUT_FOLDER}/' next to this script,")
         print(f"  then run again — or pass arguments directly:")
         print(f"    python3 -m auto_annotate.cli -i INPUT_FOLDER -o OUTPUT.eaf")
         print(f"    python3 -m auto_annotate.cli batch INPUT_ROOT [OUTPUT_FOLDER]")
@@ -356,12 +480,18 @@ def _save_review_state(state: dict[str, str], output_root: Path) -> None:
 def _write_annotation_metadata(eaf_path: Path, annotations: dict[str, Any]) -> None:
     """Write a sidecar .json with confidence/source/warning info for the review UI."""
     phases = annotations.get("phase") or []
+    occlusion = annotations.get("occlusion") or []
     confidences = [float(p.get("confidence", 1.0)) for p in phases if isinstance(p, dict)]
     sources = [str(p.get("source", "")) for p in phases if isinstance(p, dict)]
     warnings = [str(w) for w in (annotations.get("warnings") or [])]
     meta = {
+        "test_type": annotations.get("test_type"),
         "phase_confidence": min(confidences) if confidences else None,
         "phase_source": max(set(sources), key=sources.count) if sources else None,
+        "occlusion_count": len(occlusion),
+        "subject": annotations.get("subject"),
+        "pose3d": annotations.get("pose3d"),
+        "person_masks": annotations.get("person_masks"),
         "warning_count": len(warnings),
         "warnings": warnings[:5],
     }
@@ -393,10 +523,16 @@ def _confidence_label(confidence: float | None) -> str:
 def _source_label(source: str | None) -> str:
     if not source:
         return "unknown"
-    if any(k in source for k in ("core_tug", "crt_events", "core_gait", "precomputed")):
-        return "precomputed pipeline"
+    if "pose3d" in source:
+        return "3D pose kinematics"
     if "pose_estimation" in source or "pose_gait" in source:
         return "pose estimation"
+    if "sppb_balance" in source:
+        return "precomputed balance FSM"
+    if "core_gait" in source or "gait_cycles" in source:
+        return "precomputed gait cycles"
+    if any(k in source for k in ("core_tug", "crt_events", "precomputed")):
+        return "precomputed pipeline"
     if "core_bbox" in source or ("bbox" in source and "fallback" not in source and "motion" not in source):
         return "bbox+face detection"
     if "motion_fallback" in source or "bbox_motion" in source:
@@ -660,6 +796,102 @@ def _run_calibrate(argv: list[str]) -> int:
     return 0
 
 
+def _run_evaluate_ground_truth(argv: list[str]) -> int:
+    parser = build_evaluate_ground_truth_parser()
+    args = parser.parse_args(argv)
+    gt_root = Path(args.ground_truth_folder)
+    input_root = Path(args.input_folder)
+    if not gt_root.is_dir():
+        print(f"Ground truth folder not found: {gt_root}")
+        return 1
+    if not input_root.is_dir():
+        print(f"Input folder not found: {input_root}")
+        return 1
+
+    from .evaluation import (
+        evaluate_ground_truth,
+        print_ground_truth_report,
+        print_occlusion_score_tracking,
+        report_to_json,
+        track_occlusion_score,
+    )
+
+    report = evaluate_ground_truth(gt_root, input_root)
+    if args.json:
+        print(report_to_json(report))
+    else:
+        print_ground_truth_report(report)
+    if args.track_occlusion_score:
+        entry = track_occlusion_score(report, args.score_history)
+        if not args.json:
+            print_occlusion_score_tracking(entry)
+    return 0 if report["file_count"] > 0 else 1
+
+
+def _run_workbook_init(argv: list[str]) -> int:
+    parser = build_workbook_parser("workbook-init")
+    args = parser.parse_args(argv)
+    from .workbook_tracker import init_workbook
+
+    path = init_workbook(args.excel)
+    print(f"Workbook ready: {path}")
+    return 0
+
+
+def _run_workbook_scan(argv: list[str]) -> int:
+    parser = build_workbook_parser("workbook-scan")
+    args = parser.parse_args(argv)
+    from .workbook_tracker import scan_workbook
+
+    result = scan_workbook(
+        args.excel,
+        args.input_root,
+        args.output_root,
+        args.batch_output_root,
+        args.ground_truth_root,
+    )
+    print(f"Workbook updated: {args.excel}")
+    print(f"Videos found: {result['videos_found']}")
+    print(f"Auto annotations found: {result['auto_annotations_found']}")
+    print(f"Human corrections found: {result['human_corrections_found']}")
+    return 0
+
+
+def _run_check_visfrailty(argv: list[str], alias: str = "check-visfrailty") -> int:
+    parser = build_workbook_parser(alias)
+    args = parser.parse_args(argv)
+    from .workbook_tracker import check_visfrailty_outputs
+
+    result = check_visfrailty_outputs(args.excel, args.visfrailty_root)
+    print(f"VisFrailTy status updated: {args.excel}")
+    print(f"Videos checked: {result['videos_checked']}")
+    return 0
+
+
+def _run_workbook_status(argv: list[str]) -> int:
+    parser = build_workbook_parser("workbook-status")
+    args = parser.parse_args(argv)
+    from .workbook_tracker import workbook_status
+
+    summary = workbook_status(args.excel)
+    if args.json:
+        print(json.dumps(summary.to_dict(), indent=2))
+        return 0
+    print(f"Videos registered:              {summary.videos}")
+    print(f"VisFrailTy complete:           {summary.pipeline_complete}")
+    print(f"VisFrailTy partial:            {summary.pipeline_partial}")
+    print(f"VisFrailTy missing:            {summary.pipeline_missing}")
+    print(f"Auto annotated:                 {summary.auto_annotated}")
+    print(f"Human corrected:                {summary.human_corrected}")
+    print(f"Ground truth validated:         {summary.ground_truth_validated}")
+    print(f"Used for calibration:           {summary.calibration_sample_videos}")
+    print(f"Ready for auto annotation:      {summary.ready_for_auto_annotation}")
+    print(f"Ready for human review:         {summary.ready_for_human_review}")
+    print(f"Ready for calibration:          {summary.ready_for_calibration}")
+    print(f"Review queue rows:              {summary.review_queue}")
+    return 0
+
+
 def _read_eaf_annotations(eaf_path: Path) -> dict[str, list[dict]]:
     """Parse an ELAN .eaf and return {tier_id: [{start_ms, end_ms, label}]}."""
     import xml.etree.ElementTree as ET
@@ -796,9 +1028,199 @@ def _apply_calibration_to_config(
     config_path.write_text(text, encoding="utf-8")
 
 
+def _run_3dgait_tug(args: argparse.Namespace) -> int:
+    """Run the strict TUG-only adapter over read-only VisFrailTy outputs."""
+
+    video_path = Path(args.video)
+    pipeline_out = Path(args.pipeline_out)
+    out_dir = Path(args.out_dir or config_values.OUTPUT_DIR)
+    video_id = video_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    debug: dict[str, Any] = {
+        "video_id": video_id,
+        "video_path": str(video_path),
+        "pipeline_out": str(pipeline_out),
+        "warnings": [],
+    }
+    log_row = {
+        "video_id": video_id,
+        "run_timestamp": datetime.now(timezone.utc).isoformat(),
+        "tug_duration_ms": "",
+        "num_phase_unknowns": "0",
+        "eaf_written": "False",
+        "exit_code": "1",
+        "error": "",
+    }
+
+    try:
+        config_overrides = config_values.apply_config_overrides(args.config_path)
+        if config_overrides:
+            debug["config_overrides"] = config_overrides
+
+        if not video_path.exists():
+            raise FileNotFoundError(f"video not found: {video_path}")
+        if not pipeline_out.is_dir():
+            raise FileNotFoundError(f"pipeline output folder not found: {pipeline_out}")
+
+        from .phase_rules import build_tug_annotation_bundle
+        from .pipeline_adapter import load_gait_events, load_tug_interval
+
+        tug = load_tug_interval(pipeline_out / "biomarker.json")
+        log_row["tug_duration_ms"] = str(tug.duration_ms)
+        left_path = _find_gait_boundary_file(pipeline_out, "left")
+        right_path = _find_gait_boundary_file(pipeline_out, "right")
+        combined_path = _find_combined_gait_boundary_file(pipeline_out)
+        if left_path is None:
+            left_path = combined_path
+        if right_path is None:
+            right_path = combined_path
+
+        left_events = load_gait_events(left_path, "left") if left_path else []
+        right_events = load_gait_events(right_path, "right") if right_path else []
+        debug["inputs"] = {
+            "biomarker": str(pipeline_out / "biomarker.json"),
+            "left_boundaries": str(left_path) if left_path else None,
+            "right_boundaries": str(right_path) if right_path else None,
+        }
+        if not left_events:
+            debug["warnings"].append("no usable left gait events found")
+        if not right_events:
+            debug["warnings"].append("no usable right gait events found")
+
+        bundle = build_tug_annotation_bundle(tug, left_events, right_events, debug=debug)
+        num_phase_unknowns = sum(1 for phase in bundle.phases if phase.label == "unknown")
+        log_row["num_phase_unknowns"] = str(num_phase_unknowns)
+        debug["confidence_flags"] = {
+            "phase_unknowns": num_phase_unknowns,
+            "left_events_missing": not bool(left_events),
+            "right_events_missing": not bool(right_events),
+            "left_foot_unknowns": sum(1 for annotation in bundle.left if annotation.label == "unknown"),
+            "right_foot_unknowns": sum(1 for annotation in bundle.right if annotation.label == "unknown"),
+        }
+        has_unknown_labels = any(
+            annotation.label == "unknown"
+            for annotation in [*bundle.phases, *bundle.left, *bundle.right]
+        )
+
+        eaf_path = out_dir / f"{video_id}_auto.eaf"
+        write_eaf(bundle, video_path, eaf_path)
+        log_row["eaf_written"] = "True"
+        errors = validate_eaf(eaf_path)
+        debug["validation_errors"] = errors
+
+        if args.debug:
+            _write_debug_json(out_dir / f"{video_id}_debug.json", debug, bundle)
+
+        if errors:
+            invalid_path = eaf_path.with_suffix(eaf_path.suffix + ".invalid")
+            eaf_path.replace(invalid_path)
+            log_row["exit_code"] = "2"
+            log_row["error"] = "; ".join(errors[:3])
+            _append_run_log(out_dir, log_row)
+            print(f"EAF validation failed; saved as {invalid_path}", file=sys.stderr)
+            for error in errors[:5]:
+                print(f"  {error}", file=sys.stderr)
+            return 2
+
+        exit_code = 3 if has_unknown_labels else 0
+        log_row["exit_code"] = str(exit_code)
+        _append_run_log(out_dir, log_row)
+        print(f"Wrote {eaf_path}")
+        if num_phase_unknowns:
+            print(f"Review recommended: {num_phase_unknowns} unknown phase annotation(s).")
+        return exit_code
+    except Exception as exc:
+        log_row["error"] = str(exc)
+        _append_run_log(out_dir, log_row)
+        if args.debug:
+            debug["error"] = str(exc)
+            _write_debug_json(out_dir / f"{video_id}_debug.json", debug, None)
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def _find_gait_boundary_file(folder: Path, side: str) -> Path | None:
+    candidates = [
+        path
+        for path in folder.rglob("*.json")
+        if path.name != "biomarker.json"
+        and _name_mentions_side(path.stem, side)
+        and "bound" in path.stem.lower()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=_boundary_file_score)
+
+
+def _find_combined_gait_boundary_file(folder: Path) -> Path | None:
+    candidates = [
+        path
+        for path in folder.rglob("*.json")
+        if path.name != "biomarker.json"
+        and ("bound" in path.stem.lower() or "gait" in path.stem.lower())
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=_boundary_file_score)
+
+
+def _boundary_file_score(path: Path) -> int:
+    name = path.stem.lower()
+    score = 0
+    if "refined" in name:
+        score += 30
+    if "boundary" in name or "boundaries" in name:
+        score += 20
+    if "gait" in name:
+        score += 10
+    if "bbox" in name or "bounding_box" in name or "face" in name:
+        score -= 50
+    return score
+
+
+def _name_mentions_side(name: str, side: str) -> bool:
+    lower = name.lower()
+    tokens = set(part for part in re.split(r"[^a-z0-9]+", lower) if part)
+    initial = "l" if side == "left" else "r"
+    return side in tokens or f"{side}foot" in lower or f"{initial}_foot" in lower
+
+
+def _write_debug_json(path: Path, debug: dict[str, Any], bundle: Any | None) -> None:
+    payload = dict(debug)
+    if bundle is not None:
+        payload["tug"] = bundle.tug.__dict__
+        payload["phases"] = [phase.__dict__ for phase in bundle.phases]
+        payload["left"] = [annotation.__dict__ for annotation in bundle.left]
+        payload["right"] = [annotation.__dict__ for annotation in bundle.right]
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _append_run_log(out_dir: Path, row: dict[str, str]) -> None:
+    log_path = out_dir / "run_log.csv"
+    fieldnames = [
+        "video_id",
+        "run_timestamp",
+        "tug_duration_ms",
+        "num_phase_unknowns",
+        "eaf_written",
+        "exit_code",
+        "error",
+    ]
+    exists = log_path.exists()
+    with log_path.open("a", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
 def _run_single(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.video or args.pipeline_out:
+        if not args.video or not args.pipeline_out:
+            parser.error("--video and --pipeline-out must be provided together")
+        return _run_3dgait_tug(args)
 
     input_folder_arg = args.input_folder_option or args.input_folder
     output_eaf_arg = args.output_eaf_option or args.output_eaf
@@ -859,63 +1281,79 @@ def _annotate_batch(
     failures: list[tuple[Path, str]] = []
     used_outputs: set[Path] = set()
 
-    for tug_folder in _find_tug_folders(input_root):
-        if not _has_source_video(tug_folder):
-            skipped.append(tug_folder)
+    for test_folder in _find_test_folders(input_root):
+        if not _has_source_video(test_folder):
+            skipped.append(test_folder)
             continue
 
         output_eaf = _unique_output_path(
-            _batch_output_path(input_root, output_root, tug_folder),
+            _batch_output_path(input_root, output_root, test_folder),
             used_outputs,
         )
         try:
-            annotations = extract_annotations(str(tug_folder))
+            annotations = extract_annotations(str(test_folder))
             video_path = annotations.get("video_path")
             if not video_path:
-                skipped.append(tug_folder)
+                skipped.append(test_folder)
                 continue
             write_eaf(str(video_path), annotations, str(output_eaf))
             _write_annotation_metadata(output_eaf, annotations)
             annotated.append(output_eaf)
         except Exception as exc:
-            failures.append((tug_folder, str(exc)))
+            failures.append((test_folder, str(exc)))
 
     return annotated, skipped, failures
 
 
-def _find_tug_folders(input_root: Path) -> list[Path]:
-    candidates = [input_root] + [path for path in input_root.rglob("*") if path.is_dir()]
+def _find_test_folders(input_root: Path) -> list[Path]:
     return sorted(
-        (path for path in candidates if _is_test_folder(path, input_root)),
+        (path for path in _iter_candidate_dirs(input_root) if _is_test_folder(path, input_root)),
         key=lambda path: str(path).lower(),
     )
 
 
+def _iter_candidate_dirs(input_root: Path) -> list[Path]:
+    ignored_names = {
+        "$RECYCLE.BIN",
+        ".Spotlight-V100",
+        ".TemporaryItems",
+        ".Trashes",
+        ".fseventsd",
+        "System Volume Information",
+    }
+    candidates = [input_root]
+    for current, dirnames, _filenames in os.walk(input_root, onerror=lambda _err: None):
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if dirname not in ignored_names and not dirname.startswith("._")
+        ]
+        current_path = Path(current)
+        if current_path != input_root:
+            candidates.append(current_path)
+    return candidates
+
+
 def _is_test_folder(path: Path, root: Path) -> bool:
-    """Return True if this folder is identifiable as a TUG or CRT test folder.
+    """Return True if this folder is identifiable as a supported test folder.
 
     Checks the folder name and its immediate parent (up to the scan root) so that
     structures like root/tug/P45 are picked up even when the leaf name is neutral.
     """
-    keywords = ("tug", "crt")
-    if any(kw in path.name.lower() for kw in keywords):
-        return True
-    if path != root and any(kw in path.parent.name.lower() for kw in keywords):
-        return True
-    return False
+    return _has_source_video(path)
 
 
 def _has_source_video(folder: Path) -> bool:
     return any(folder.glob("rgb_video*.mp4"))
 
 
-def _batch_output_path(input_root: Path, output_root: Path, tug_folder: Path) -> Path:
+def _batch_output_path(input_root: Path, output_root: Path, test_folder: Path) -> Path:
     try:
-        relative = tug_folder.relative_to(input_root)
+        relative = test_folder.relative_to(input_root)
     except ValueError:
-        relative = Path(tug_folder.name)
+        relative = Path(test_folder.name)
     parent = relative.parent if str(relative.parent) != "." else Path()
-    return output_root / parent / f"{_safe_stem(tug_folder.name)}_auto.eaf"
+    return output_root / parent / f"{_safe_stem(test_folder.name)}_auto.eaf"
 
 
 def _safe_stem(name: str) -> str:
@@ -929,7 +1367,7 @@ def _safe_stem(name: str) -> str:
             chars.append("_")
             last_was_separator = True
     stem = "".join(chars).strip("_")
-    return stem or "TUG"
+    return stem or "test"
 
 
 def _unique_output_path(path: Path, used_outputs: set[Path]) -> Path:
@@ -948,6 +1386,9 @@ def _print_summary(output_eaf: Path, annotations: dict[str, Any]) -> None:
     left = annotations.get("left_foot") or []
     right = annotations.get("right_foot") or []
     print(f"Wrote {output_eaf}")
+    test_type = annotations.get("test_type")
+    if test_type:
+        print(f"Test type: {str(test_type).replace('_', ' ')}")
     if test:
         print(f"Test interval: {test[0]['start_ms']} ms - {test[0]['end_ms']} ms")
     else:
@@ -967,9 +1408,9 @@ def _print_batch_summary(
     failures: list[tuple[Path, str]],
 ) -> None:
     if skipped:
-        print(f"Skipped TUG folders without rgb_video_*.mp4: {len(skipped)}")
+        print(f"Skipped test folders without rgb_video_*.mp4: {len(skipped)}")
     if failures:
-        print(f"Failed TUG folders: {len(failures)}")
+        print(f"Failed test folders: {len(failures)}")
         for folder, reason in failures[:5]:
             print(f"  {folder}: {reason}")
     print("Annotated files:")

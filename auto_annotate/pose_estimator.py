@@ -256,7 +256,6 @@ def crt_phases_from_pose_signal(
     """
     from .config import (
         CRT_MIN_RISE_FRAMES,
-        CRT_REPS,
         CRT_SIT_STAND_THRESHOLD_RATIO,
         CRT_SMOOTH_WINDOW_SEC,
     )
@@ -300,8 +299,6 @@ def crt_phases_from_pose_signal(
         if di < len(down_frames) and down_frames[di] - uf >= min_rise:
             pairs.append((uf, down_frames[di]))
             di += 1
-    pairs = pairs[:CRT_REPS]
-
     if not pairs:
         warnings.append("pose estimation: no CRT rise cycles detected from hip signal")
         return None

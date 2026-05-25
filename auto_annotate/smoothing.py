@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from . import config as config_values
 from .config import UNKNOWN_LABEL
-from .types import Interval
+from .types import FootAnnotation, GaitEvent, Interval, PhaseAnnotation
 
 
 def clean_intervals(intervals: list[Interval]) -> list[Interval]:
@@ -116,3 +117,160 @@ def smooth_intervals(
         suppress_short_flicker(intervals, min_duration_ms),
         merge_gap_ms,
     )
+
+
+def smooth_phase_annotations(
+    phases: list[PhaseAnnotation],
+    gait_events: list[GaitEvent] | None = None,
+) -> list[PhaseAnnotation]:
+    """Conservatively remove TUG phase jitter without inventing transitions."""
+
+    cleaned = [
+        phase
+        for phase in sorted(phases, key=lambda item: (item.start_ms, item.end_ms))
+        if phase.end_ms > phase.start_ms
+    ]
+    if not cleaned:
+        return []
+    cleaned = _absorb_short_phases(cleaned, int(config_values.MIN_PHASE_DURATION_MS))
+    cleaned = _merge_walk_micro_turns(cleaned, int(config_values.MIN_WALK_DURATION_MS))
+    if gait_events:
+        cleaned = _snap_phase_boundaries(cleaned, gait_events, max_delta_ms=50)
+    return _merge_adjacent_phase_annotations(cleaned)
+
+
+def smooth_foot_event_times(events: list[GaitEvent]) -> list[GaitEvent]:
+    """Median-smooth repeated foot event timings in a small local window."""
+
+    if len(events) < 3:
+        return sorted(events, key=lambda event: event.time_ms)
+    window_ms = int(config_values.SMOOTHING_WINDOW_MS)
+    smoothed: list[GaitEvent] = []
+    ordered = sorted(events, key=lambda event: event.time_ms)
+    for idx, event in enumerate(ordered):
+        neighbours = [
+            other.time_ms
+            for other in ordered[max(0, idx - 1): min(len(ordered), idx + 2)]
+            if other.event_type == event.event_type and abs(other.time_ms - event.time_ms) <= window_ms
+        ]
+        if neighbours:
+            neighbours = sorted(neighbours)
+            time_ms = neighbours[len(neighbours) // 2]
+        else:
+            time_ms = event.time_ms
+        smoothed.append(GaitEvent(time_ms, event.side, event.event_type))
+    return sorted(smoothed, key=lambda event: (event.time_ms, event.event_type))
+
+
+def smooth_foot_annotations(annotations: list[FootAnnotation]) -> list[FootAnnotation]:
+    """Merge adjacent same-label foot annotations and drop zero-length intervals."""
+
+    cleaned = [
+        annotation
+        for annotation in sorted(annotations, key=lambda item: (item.start_ms, item.end_ms))
+        if annotation.end_ms > annotation.start_ms
+    ]
+    if not cleaned:
+        return []
+    merged: list[FootAnnotation] = []
+    for annotation in cleaned:
+        if (
+            merged
+            and merged[-1].label == annotation.label
+            and merged[-1].side == annotation.side
+            and annotation.start_ms - merged[-1].end_ms <= 1
+        ):
+            prev = merged[-1]
+            merged[-1] = FootAnnotation(prev.start_ms, annotation.end_ms, prev.label, prev.side)
+        else:
+            merged.append(annotation)
+    return merged
+
+
+def _absorb_short_phases(
+    phases: list[PhaseAnnotation],
+    min_duration_ms: int,
+) -> list[PhaseAnnotation]:
+    out: list[PhaseAnnotation] = []
+    idx = 0
+    while idx < len(phases):
+        phase = phases[idx]
+        if phase.end_ms - phase.start_ms >= min_duration_ms:
+            out.append(phase)
+            idx += 1
+            continue
+        prev = out[-1] if out else None
+        nxt = phases[idx + 1] if idx + 1 < len(phases) else None
+        if prev and nxt and prev.label == nxt.label:
+            out[-1] = PhaseAnnotation(prev.start_ms, nxt.end_ms, prev.label)
+            idx += 2
+        elif prev:
+            out[-1] = PhaseAnnotation(prev.start_ms, phase.end_ms, prev.label)
+            idx += 1
+        elif nxt:
+            out.append(PhaseAnnotation(phase.start_ms, nxt.end_ms, nxt.label))
+            idx += 2
+        else:
+            out.append(PhaseAnnotation(phase.start_ms, phase.end_ms, UNKNOWN_LABEL))
+            idx += 1
+    return out
+
+
+def _merge_walk_micro_turns(
+    phases: list[PhaseAnnotation],
+    min_walk_duration_ms: int,
+) -> list[PhaseAnnotation]:
+    out: list[PhaseAnnotation] = []
+    idx = 0
+    while idx < len(phases):
+        if (
+            idx + 2 < len(phases)
+            and phases[idx].label == "walk"
+            and phases[idx + 1].label == "turn"
+            and phases[idx + 2].label == "walk"
+            and phases[idx + 1].end_ms - phases[idx + 1].start_ms < min_walk_duration_ms
+            and (
+                phases[idx].end_ms - phases[idx].start_ms < min_walk_duration_ms
+                or phases[idx + 2].end_ms - phases[idx + 2].start_ms < min_walk_duration_ms
+            )
+        ):
+            out.append(PhaseAnnotation(phases[idx].start_ms, phases[idx + 2].end_ms, "walk"))
+            idx += 3
+            continue
+        out.append(phases[idx])
+        idx += 1
+    return out
+
+
+def _snap_phase_boundaries(
+    phases: list[PhaseAnnotation],
+    gait_events: list[GaitEvent],
+    max_delta_ms: int,
+) -> list[PhaseAnnotation]:
+    event_times = sorted({event.time_ms for event in gait_events})
+    if not event_times or len(phases) < 2:
+        return phases
+    boundaries = [phases[0].start_ms]
+    for phase in phases[:-1]:
+        boundary = phase.end_ms
+        nearest = min(event_times, key=lambda value: abs(value - boundary))
+        boundaries.append(nearest if abs(nearest - boundary) <= max_delta_ms else boundary)
+    boundaries.append(phases[-1].end_ms)
+    snapped: list[PhaseAnnotation] = []
+    for idx, phase in enumerate(phases):
+        start = boundaries[idx]
+        end = boundaries[idx + 1]
+        if end > start:
+            snapped.append(PhaseAnnotation(start, end, phase.label))
+    return snapped
+
+
+def _merge_adjacent_phase_annotations(phases: list[PhaseAnnotation]) -> list[PhaseAnnotation]:
+    merged: list[PhaseAnnotation] = []
+    for phase in phases:
+        if merged and merged[-1].label == phase.label and phase.start_ms <= merged[-1].end_ms + 1:
+            prev = merged[-1]
+            merged[-1] = PhaseAnnotation(prev.start_ms, max(prev.end_ms, phase.end_ms), prev.label)
+        else:
+            merged.append(phase)
+    return merged

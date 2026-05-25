@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
+    PATIENT_LOCK_MAX_FRAGMENT_GAP,
     SUBJECT_MIN_COVERAGE,
     TRACK_IOU_THRESHOLD,
     TRACK_MAX_FRAME_GAP,
@@ -125,18 +126,27 @@ def track_detections(
 def select_main_subject(
     boxes: list[DetectionBox],
     frame_width: int | None = None,
+    frame_height: int | None = None,
+    num_frames: int | None = None,
     min_coverage: float = SUBJECT_MIN_COVERAGE,
 ) -> SubjectTrack:
-    """Select the first stable person closest to frame centre."""
+    """Select and lock the patient track.
+
+    The patient is normally the stable centred person, but occlusion can split
+    that person into several tracker IDs.  After choosing the best candidate,
+    reconnect short, compatible fragments so downstream phase and occlusion
+    logic follows the same patient through bystander/RA occlusions.
+    """
 
     tracked = track_detections(boxes)
     if not tracked:
-        return SubjectTrack(None, [], 0.0, "no person detections")
+        return SubjectTrack(None, [], 0.0, "no person detections", [])
 
     width = frame_width or _infer_frame_width(tracked)
+    height = frame_height or _infer_frame_height(tracked)
     frame_min = min(box.frame for box in tracked)
     frame_max = max(box.frame for box in tracked)
-    total_frames = max(1, frame_max - frame_min + 1)
+    total_frames = max(1, int(num_frames or 0), frame_max - frame_min + 1)
     min_frames = max(3, int(round(total_frames * min_coverage)))
 
     by_track: dict[int, list[DetectionBox]] = defaultdict(list)
@@ -145,7 +155,7 @@ def select_main_subject(
             by_track[box.track_id].append(box)
 
     max_count = max(len(group) for group in by_track.values())
-    stable_cutoff = max(min_frames, int(max_count * 0.8))
+    stable_cutoff = max(min_frames, int(max_count * 0.65))
     candidates = [
         (track_id, group)
         for track_id, group in by_track.items()
@@ -163,23 +173,126 @@ def select_main_subject(
         mean_center_dist = sum(
             abs(box.center_x - width / 2.0) / half_width for box in group
         ) / len(group)
+        y_range = max(box.center_y for box in group) - min(box.center_y for box in group)
+        x_range = max(box.center_x for box in group) - min(box.center_x for box in group)
         area_bonus = _median([box.area for box in group]) / max(max_median_area, 1.0)
         motion_bonus = min(
             1.0,
-            (max(box.center_x for box in group) - min(box.center_x for box in group))
-            / max(width * 0.15, 1.0),
+            ((x_range / max(width, 1.0)) + (y_range / max(height, 1.0)))
+            / 0.25,
         )
-        adjusted_center_dist = mean_center_dist - 0.20 * area_bonus - 0.10 * motion_bonus
-        return (adjusted_center_dist, -len(group), min(box.frame for box in group))
+        excessive_motion = max(
+            0.0,
+            (x_range / max(width, 1.0) - 0.45) / 0.35,
+            (y_range / max(height, 1.0) - 0.45) / 0.35,
+        )
+        coverage = len({box.frame for box in group}) / total_frames
+        early_bonus = 1.0 if min(box.frame for box in group) <= frame_min + total_frames * 0.20 else 0.0
+        patient_score = (
+            0.38 * coverage
+            + 0.28 * (1.0 - min(1.0, mean_center_dist))
+            + 0.20 * area_bonus
+            + 0.06 * motion_bonus
+            + 0.08 * early_bonus
+            - 0.28 * min(1.0, excessive_motion)
+        )
+        return (-patient_score, -len(group), min(box.frame for box in group))
 
     selected_id, selected_boxes = min(candidates, key=rank)
-    mean_dist = rank((selected_id, selected_boxes))[0]
-    confidence = max(0.0, min(1.0, (len(selected_boxes) / total_frames) * (1.0 - mean_dist)))
+    locked_boxes, locked_ids = _lock_patient_fragments(
+        selected_id,
+        selected_boxes,
+        by_track,
+        width,
+        height,
+    )
+    selected_rank = rank((selected_id, selected_boxes))
+    patient_score = max(0.0, min(1.0, -selected_rank[0]))
+    coverage = len({box.frame for box in locked_boxes}) / total_frames
+    confidence = max(0.0, min(1.0, 0.65 * patient_score + 0.35 * coverage))
+    reason = "locked patient track"
+    if len(locked_ids) > 1:
+        reason += f" stitched from {len(locked_ids)} tracker fragments"
     return SubjectTrack(
         selected_id,
-        sorted(selected_boxes, key=lambda b: b.frame),
+        sorted(locked_boxes, key=lambda b: b.frame),
         confidence,
-        "stable centered track",
+        reason,
+        sorted(locked_ids),
+    )
+
+
+def _lock_patient_fragments(
+    selected_id: int,
+    selected_boxes: list[DetectionBox],
+    by_track: dict[int, list[DetectionBox]],
+    frame_width: int,
+    frame_height: int,
+) -> tuple[list[DetectionBox], set[int]]:
+    locked = sorted(selected_boxes, key=lambda box: box.frame)
+    locked_ids = {selected_id}
+    while True:
+        best_id: int | None = None
+        best_score = 0.0
+        for track_id, group in by_track.items():
+            if track_id in locked_ids:
+                continue
+            score = _fragment_compatibility(locked, sorted(group, key=lambda box: box.frame), frame_width, frame_height)
+            if score > best_score:
+                best_score = score
+                best_id = track_id
+        if best_id is None or best_score < 0.55:
+            break
+        locked.extend(by_track[best_id])
+        locked = sorted(locked, key=lambda box: box.frame)
+        locked_ids.add(best_id)
+    return locked, locked_ids
+
+
+def _fragment_compatibility(
+    locked: list[DetectionBox],
+    fragment: list[DetectionBox],
+    frame_width: int,
+    frame_height: int,
+) -> float:
+    if not locked or not fragment:
+        return 0.0
+    before = fragment[-1].frame < locked[0].frame
+    after = fragment[0].frame > locked[-1].frame
+    if not before and not after:
+        return 0.0
+
+    if before:
+        gap = locked[0].frame - fragment[-1].frame
+        a = fragment[-1]
+        b = locked[0]
+    else:
+        gap = fragment[0].frame - locked[-1].frame
+        a = locked[-1]
+        b = fragment[0]
+    if gap <= 0 or gap > PATIENT_LOCK_MAX_FRAGMENT_GAP:
+        return 0.0
+
+    dx = abs(a.center_x - b.center_x) / max(float(frame_width), 1.0)
+    dy = abs(a.center_y - b.center_y) / max(float(frame_height), 1.0)
+    distance = (dx * dx + dy * dy) ** 0.5
+    if distance > 0.35:
+        return 0.0
+
+    height_ratio = min(a.height, b.height) / max(a.height, b.height, 1.0)
+    area_ratio = min(a.area, b.area) / max(a.area, b.area, 1.0)
+    if height_ratio < 0.35 or area_ratio < 0.20:
+        return 0.0
+
+    gap_penalty = min(1.0, gap / max(float(PATIENT_LOCK_MAX_FRAGMENT_GAP), 1.0))
+    distance_score = 1.0 - min(1.0, distance / 0.35)
+    length_score = min(1.0, len(fragment) / 20.0)
+    return (
+        0.45 * distance_score
+        + 0.25 * height_ratio
+        + 0.15 * area_ratio
+        + 0.10 * length_score
+        + 0.05 * (1.0 - gap_penalty)
     )
 
 
@@ -205,8 +318,10 @@ def _parse_detection(
         label = str(det.get("label") or det.get("class") or det.get("className") or "").lower()
         if label and "person" not in label and "face" not in label:
             return None
-        track_id = _safe_int(det.get("track_id", det.get("trackId", det.get("id"))))
-        score = _safe_float(det.get("score", det.get("confidence")))
+        track_id = _safe_int(det.get("track_id", det.get("trackId", det.get("trackerId", det.get("id")))))
+        if track_id is not None and track_id < 0:
+            track_id = None
+        score = _safe_float(det.get("score", det.get("confidence", det.get("confidenceScore"))))
         original_size = det.get("originalImageSize") or det.get("imageSize")
         if det.get("xyxy") is not None:
             coords = det.get("xyxy")
@@ -289,6 +404,11 @@ def _safe_float(value: Any) -> float | None:
 def _infer_frame_width(boxes: list[DetectionBox]) -> int:
     max_x = max((box.x2 for box in boxes), default=0.0)
     return max(1, int(round(max_x)))
+
+
+def _infer_frame_height(boxes: list[DetectionBox]) -> int:
+    max_y = max((box.y2 for box in boxes), default=0.0)
+    return max(1, int(round(max_y)))
 
 
 def _median(values: list[float]) -> float:

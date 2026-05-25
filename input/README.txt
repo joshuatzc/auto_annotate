@@ -1,13 +1,17 @@
-Place TUG or CRT test bundles here, one sub-folder per test.
+Place FrailScreen test bundles here, one sub-folder per test.
 
 Each bundle folder should contain at minimum:
   rgb_video_*.mp4
   bounding_box_data_*.json          (optional — improves quality)
 
 Optional files:
+  pose3d.json                       (cached normalized 3D pose; created/reused automatically)
   bounding_box_face_data_*.json     (TUG only)
   sppb_results.json                 (CRT — precomputed chair rise events)
-  out2.pkl  /  out2.csv             (TUG — precomputed phase boundaries)
+  out2.pkl  /  out2.csv             (TUG/GS — precomputed phase or gait cycles)
+
+Supported folder names include TUG, CRT, GS1/GS2, SBS, ST, and FT.
+SBS/ST/FT phase tiers cover the full video/test span with in_pos or out_of_pos.
 
 Example layout:
   input/

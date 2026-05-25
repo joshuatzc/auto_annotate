@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from . import config as config_values
 from .config import (
     CRT_MIN_RISE_FRAMES,
-    CRT_REPS,
     CRT_SIT_STAND_THRESHOLD_RATIO,
     CRT_SMOOTH_WINDOW_SEC,
     FALLBACK_PHASE_RATIOS,
@@ -17,8 +19,302 @@ from .config import (
     TEST_LABELS,
     TUG_PHASE_SEQUENCE,
 )
-from .smoothing import clean_intervals, fill_internal_gaps, smooth_intervals
-from .types import Interval
+from .smoothing import (
+    clean_intervals,
+    fill_internal_gaps,
+    smooth_foot_annotations,
+    smooth_foot_event_times,
+    smooth_intervals,
+    smooth_phase_annotations,
+)
+from .types import AnnotationBundle, FootAnnotation, GaitEvent, Interval, PhaseAnnotation, TUGInterval
+
+
+def build_tug_annotation_bundle(
+    tug: TUGInterval,
+    left_events: list[GaitEvent],
+    right_events: list[GaitEvent],
+    pose_keypoints: list[dict[str, Any]] | None = None,
+    debug: dict[str, Any] | None = None,
+) -> AnnotationBundle:
+    """Create the four ELAN tiers for a TUG recording from 3DGait events."""
+
+    all_events = _clip_gait_events(left_events + right_events, tug)
+    phases = phase_annotations_from_gait_events(tug, all_events, pose_keypoints, debug)
+    walk_phases = [phase for phase in phases if phase.label == "walk"]
+
+    left = foot_annotations_from_events(tug, left_events, "left", walk_phases)
+    right = foot_annotations_from_events(tug, right_events, "right", walk_phases)
+    if debug is not None:
+        debug["raw_events"] = [event.__dict__ for event in all_events]
+        debug["post_smoothing_phases"] = [phase.__dict__ for phase in phases]
+        debug["left_foot"] = [annotation.__dict__ for annotation in left]
+        debug["right_foot"] = [annotation.__dict__ for annotation in right]
+    return AnnotationBundle(tug, phases, left, right)
+
+
+def phase_annotations_from_gait_events(
+    tug: TUGInterval,
+    events: list[GaitEvent],
+    pose_keypoints: list[dict[str, Any]] | None = None,
+    debug: dict[str, Any] | None = None,
+) -> list[PhaseAnnotation]:
+    """Transparent TUG state machine driven by gait cadence and optional pose."""
+
+    cadence_events = _cadence_events(_clip_gait_events(events, tug))
+    if not cadence_events:
+        phases = [PhaseAnnotation(tug.start_ms, tug.end_ms, "unknown")]
+        if debug is not None:
+            debug["transition_notes"] = ["no usable gait events inside TUG interval"]
+            debug["pre_smoothing_phases"] = [phase.__dict__ for phase in phases]
+        return phases
+
+    notes: list[str] = []
+    first_event = cadence_events[0]
+    alternation_time = _first_bilateral_alternation(cadence_events)
+    if alternation_time is None:
+        notes.append("no bilateral alternation; phase after first gait event is unknown")
+        phases = [
+            PhaseAnnotation(tug.start_ms, first_event.time_ms, "sit"),
+            PhaseAnnotation(first_event.time_ms, tug.end_ms, "unknown"),
+        ]
+        phases = _clip_phase_annotations(phases, tug)
+        if debug is not None:
+            debug["transition_notes"] = notes
+            debug["pre_smoothing_phases"] = [phase.__dict__ for phase in phases]
+        return smooth_phase_annotations(phases, cadence_events)
+
+    turn = _detect_turn_segment(tug, cadence_events, pose_keypoints, notes)
+    final_sit_start = _final_sit_start(tug, cadence_events)
+    stand_to_sit_start = _stand_to_sit_start(tug, cadence_events, final_sit_start)
+
+    phases: list[PhaseAnnotation] = []
+    _append_phase(phases, tug.start_ms, first_event.time_ms, "sit")
+    _append_phase(phases, first_event.time_ms, alternation_time, "sit-to-stand")
+
+    if turn is None:
+        unknown_start, unknown_end = _fallback_unknown_turn_window(alternation_time, stand_to_sit_start)
+        _append_phase(phases, alternation_time, unknown_start, "walk")
+        _append_phase(phases, unknown_start, unknown_end, "unknown")
+        _append_phase(phases, unknown_end, stand_to_sit_start, "walk")
+        notes.append("turn confidence below threshold; middle turn segment labelled unknown")
+    else:
+        turn_start, turn_end, turn_label = turn
+        _append_phase(phases, alternation_time, turn_start, "walk")
+        _append_phase(phases, turn_start, turn_end, turn_label)
+        if stand_to_sit_start - turn_end >= int(config_values.MIN_WALK_DURATION_MS):
+            _append_phase(phases, turn_end, stand_to_sit_start, "walk")
+        else:
+            notes.append("second walk after turn is too short; pivot turner path kept without second walk")
+
+    _append_phase(phases, stand_to_sit_start, final_sit_start or tug.end_ms, "stand-to-sit")
+    if final_sit_start is not None:
+        _append_phase(phases, final_sit_start, tug.end_ms, "sit")
+
+    phases = _clip_phase_annotations(phases, tug)
+    phases = _cover_tug_phase_span(phases, tug)
+    if debug is not None:
+        debug["transition_notes"] = notes
+        debug["pre_smoothing_phases"] = [phase.__dict__ for phase in phases]
+    return smooth_phase_annotations(phases, cadence_events)
+
+
+def foot_annotations_from_events(
+    tug: TUGInterval,
+    events: list[GaitEvent],
+    side: str,
+    walk_phases: list[PhaseAnnotation],
+) -> list[FootAnnotation]:
+    """Convert one side's gait events to contiguous stance/swing intervals during walks."""
+
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'")
+    clipped = [
+        event
+        for event in smooth_foot_event_times(_clip_gait_events(events, tug))
+        if event.side == side and event.event_type in {"stance_start", "swing_start"}
+    ]
+    label_prefix = f"{side}_"
+    if len(clipped) < 2:
+        return [
+            FootAnnotation(walk.start_ms, walk.end_ms, "unknown", side)
+            for walk in walk_phases
+            if walk.end_ms > walk.start_ms
+        ]
+
+    annotations: list[FootAnnotation] = []
+    for walk in walk_phases:
+        span_events = [event for event in clipped if walk.start_ms <= event.time_ms <= walk.end_ms]
+        if len(span_events) < 2:
+            annotations.append(FootAnnotation(walk.start_ms, walk.end_ms, "unknown", side))
+            continue
+        cursor = walk.start_ms
+        state = "unknown"
+        for event in span_events:
+            if event.time_ms > cursor:
+                annotations.append(FootAnnotation(cursor, event.time_ms, state, side))
+            state = label_prefix + ("stance" if event.event_type == "stance_start" else "swing")
+            cursor = max(cursor, event.time_ms)
+        if cursor < walk.end_ms:
+            annotations.append(FootAnnotation(cursor, walk.end_ms, state, side))
+    return smooth_foot_annotations(annotations)
+
+
+def _clip_gait_events(events: list[GaitEvent], tug: TUGInterval) -> list[GaitEvent]:
+    return sorted(
+        (
+            event
+            for event in events
+            if tug.start_ms <= event.time_ms <= tug.end_ms
+            and event.event_type in {"stance_start", "swing_start"}
+            and event.side in {"left", "right"}
+        ),
+        key=lambda event: (event.time_ms, event.side, event.event_type),
+    )
+
+
+def _cadence_events(events: list[GaitEvent]) -> list[GaitEvent]:
+    stance = [event for event in events if event.event_type == "stance_start"]
+    return stance if len(stance) >= 2 else events
+
+
+def _first_bilateral_alternation(events: list[GaitEvent]) -> int | None:
+    previous: GaitEvent | None = None
+    for event in events:
+        if previous is not None and event.side != previous.side:
+            return event.time_ms
+        previous = event
+    return None
+
+
+def _detect_turn_segment(
+    tug: TUGInterval,
+    events: list[GaitEvent],
+    pose_keypoints: list[dict[str, Any]] | None,
+    notes: list[str],
+) -> tuple[int, int, str] | None:
+    pose_turn = _turn_from_pose_keypoints(tug, pose_keypoints)
+    if pose_turn is not None:
+        notes.append("turn detected from optional pose horizontal reversal")
+        return pose_turn[0], pose_turn[1], "turn"
+
+    if len(events) < 4:
+        return None
+    gaps = [
+        (right.time_ms - left.time_ms, left.time_ms, right.time_ms)
+        for left, right in zip(events, events[1:])
+        if right.time_ms > left.time_ms
+    ]
+    if not gaps:
+        return None
+    gap_ms, start_ms, end_ms = max(gaps, key=lambda item: item[0])
+    min_gap = max(500, int(config_values.MIN_WALK_DURATION_MS))
+    if gap_ms >= min_gap:
+        notes.append(f"turn detected from cadence gap of {gap_ms} ms")
+        return start_ms, end_ms, "turn"
+    return None
+
+
+def _turn_from_pose_keypoints(
+    tug: TUGInterval,
+    pose_keypoints: list[dict[str, Any]] | None,
+) -> tuple[int, int] | None:
+    if not pose_keypoints or len(pose_keypoints) < 5:
+        return None
+    points: list[tuple[int, float]] = []
+    for item in pose_keypoints:
+        try:
+            time_ms = int(round(float(item.get("time_ms", item.get("timestamp_ms")))))
+            x_value = item.get("hip_x", item.get("pelvis_x", item.get("head_x")))
+            x = float(x_value)
+        except (TypeError, ValueError):
+            continue
+        if tug.start_ms <= time_ms <= tug.end_ms:
+            points.append((time_ms, x))
+    points.sort()
+    if len(points) < 5:
+        return None
+    velocities: list[tuple[int, float]] = []
+    for (left_t, left_x), (right_t, right_x) in zip(points, points[1:]):
+        dt_s = max((right_t - left_t) / 1000.0, 1e-6)
+        velocities.append((right_t, (right_x - left_x) / dt_s))
+    threshold = float(config_values.TURN_VELOCITY_THRESHOLD)
+    candidates = [time_ms for time_ms, velocity in velocities if abs(velocity) < threshold]
+    if not candidates:
+        return None
+    start = candidates[0]
+    end = candidates[-1]
+    if end - start < int(config_values.MIN_PHASE_DURATION_MS):
+        pad = int(config_values.MIN_PHASE_DURATION_MS) // 2
+        start -= pad
+        end += pad
+    start = max(tug.start_ms, start)
+    end = min(tug.end_ms, end)
+    return (start, end) if end > start else None
+
+
+def _final_sit_start(tug: TUGInterval, events: list[GaitEvent]) -> int | None:
+    if not events:
+        return None
+    candidate = events[-1].time_ms + 500
+    if tug.end_ms - candidate >= int(config_values.MIN_PHASE_DURATION_MS):
+        return candidate
+    return None
+
+
+def _stand_to_sit_start(
+    tug: TUGInterval,
+    events: list[GaitEvent],
+    final_sit_start: int | None,
+) -> int:
+    min_phase = int(config_values.MIN_PHASE_DURATION_MS)
+    end_limit = (final_sit_start or tug.end_ms) - min_phase
+    if events:
+        candidate = events[-1].time_ms
+    else:
+        candidate = tug.end_ms - 700
+    candidate = min(candidate, end_limit)
+    return max(tug.start_ms + min_phase, candidate)
+
+
+def _fallback_unknown_turn_window(start_ms: int, end_ms: int) -> tuple[int, int]:
+    if end_ms <= start_ms:
+        return start_ms, end_ms
+    duration = end_ms - start_ms
+    width = min(max(int(config_values.MIN_WALK_DURATION_MS), int(duration * 0.20)), duration)
+    center = start_ms + duration // 2
+    turn_start = max(start_ms, center - width // 2)
+    turn_end = min(end_ms, turn_start + width)
+    return turn_start, turn_end
+
+
+def _append_phase(phases: list[PhaseAnnotation], start_ms: int, end_ms: int, label: str) -> None:
+    if end_ms > start_ms:
+        phases.append(PhaseAnnotation(start_ms, end_ms, label))
+
+
+def _clip_phase_annotations(phases: list[PhaseAnnotation], tug: TUGInterval) -> list[PhaseAnnotation]:
+    out: list[PhaseAnnotation] = []
+    for phase in phases:
+        start = max(tug.start_ms, phase.start_ms)
+        end = min(tug.end_ms, phase.end_ms)
+        if end > start:
+            out.append(PhaseAnnotation(start, end, phase.label))
+    return out
+
+
+def _cover_tug_phase_span(phases: list[PhaseAnnotation], tug: TUGInterval) -> list[PhaseAnnotation]:
+    out: list[PhaseAnnotation] = []
+    cursor = tug.start_ms
+    for phase in sorted(phases, key=lambda item: (item.start_ms, item.end_ms)):
+        if phase.start_ms > cursor:
+            out.append(PhaseAnnotation(cursor, phase.start_ms, "unknown"))
+        if phase.end_ms > cursor:
+            out.append(PhaseAnnotation(max(cursor, phase.start_ms), phase.end_ms, phase.label))
+            cursor = phase.end_ms
+    if cursor < tug.end_ms:
+        out.append(PhaseAnnotation(cursor, tug.end_ms, "unknown"))
+    return out
 
 
 def frame_to_ms(frame: int | float, fps: float, frame_base: str = "zero") -> int:
@@ -220,7 +516,7 @@ def phase_intervals_from_crt_events(
     if not butt_offs or not butt_ons:
         return []
 
-    pairs = list(zip(butt_offs[:CRT_REPS], butt_ons[:CRT_REPS]))
+    pairs = list(zip(butt_offs, butt_ons))
     if not pairs:
         return []
 
@@ -307,8 +603,6 @@ def crt_phase_intervals_from_detections(
             if df - uf >= CRT_MIN_RISE_FRAMES:
                 pairs.append((uf, df))
             di += 1
-    pairs = pairs[:CRT_REPS]
-
     if not pairs:
         return []
 
